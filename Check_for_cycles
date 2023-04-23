@@ -1,0 +1,347 @@
+CREATE OR REPLACE PROCEDURE get_cycles_3 (
+    obj_name VARCHAR2,
+    col_names VARCHAR2
+) IS
+    --переменные для проверки столбцов на существование
+    temp_col_1 VARCHAR2(40):= '';
+    temp_col_2 VARCHAR2(40):= '';
+    --переменная итератора
+    iter NUMBER(4):=1;
+    --переменная для проверки таблицы на существование
+    temp_obj_name user_objects.object_name%type;
+    --проверка на необходимость удаления последовательности
+    seq_for_delete BOOLEAN;
+    --переменная счетчика
+    cnt NUMBER(6):=0;
+    --переменные для проверки на повторение
+    no_repeats BOOLEAN:=true;
+    no_repeats_2 BOOLEAN:=true;
+    -- запрос на получение данных из исходной таблицы
+    v_stmt VARCHAR2(1000);
+    -- тип курсора на получение данных из исходной таблицы
+    TYPE ref_csr_type IS REF CURSOR;
+    -- курсор на получение данных
+    cur_input ref_csr_type;
+    --переменная курсора для проверки входных в процедуру данных
+    cur_check_input ref_csr_type;
+    -- тип записи для исходных данных
+    TYPE type_rec IS RECORD
+    (first_col NUMBER(8, 3),
+     second_col NUMBER(8, 3));
+    -- тип таблицы записей для хранения исходных данных
+    TYPE type_tab_rec IS TABLE OF type_rec;
+    -- таблица для хранения исходных данных
+    input_tab type_tab_rec:=type_tab_rec();
+    -- тип массива для хранения одного цикла
+    TYPE type_seq IS TABLE OF NUMBER(8,3);
+    --последовательность пройденных вершин
+    passed_start_points type_seq := type_seq();
+    --временная последовательность для сортировки
+    temp_seq type_seq := type_seq();
+    -- тип массива массивов для хранения всех циклов
+    TYPE type_tab_of_seqs IS TABLE OF type_seq;
+    -- массив последовательностей
+    tab_of_seqs type_tab_of_seqs:=type_tab_of_seqs();
+    --результирующий массив последовательностей
+    result_tab_of_seqs type_tab_of_seqs:=type_tab_of_seqs();
+    -- текущая вершина для обработки
+    v_current_node NUMBER(6);
+    -- ошибка для вызова при пустых входных значениях
+    e_input_empty EXCEPTION;
+    --ошибка при получении малозаполненной таблицы
+    e_table_empty EXCEPTION;
+    --ошибка при отсутствии последовательностей
+    e_no_seqs EXCEPTION;
+    --ошибка при отсутствии таблицы в схеме
+    e_no_table EXCEPTION;
+    --ошибка при отсутствии столбцов таблицы
+    e_no_cols EXCEPTION;
+    
+BEGIN
+--вызов ошибки при ситуации, если переданы пустые или налл строки
+    IF LENGTH(obj_name) = 0 OR 
+       LENGTH(col_names) = 0 OR
+       obj_name IS NULL OR
+       col_names IS NULL THEN
+       RAISE e_input_empty;
+    END IF;
+    --проверка на нахождение таблицы в схеме
+    v_stmt:='SELECT OBJECT_NAME FROM USER_OBJECTS WHERE OBJECT_NAME = ''' || 
+             to_char(UPPER(obj_name)) || 
+             ''' AND object_type in (''TABLE'', ''VIEW'')';
+    OPEN cur_check_input FOR v_stmt;
+    LOOP
+        FETCH cur_check_input INTO temp_obj_name;
+        IF cnt = 0 and cur_check_input%NOTFOUND THEN
+            RAISE e_no_table;
+        END IF;
+        cnt:= cnt+1;
+        EXIT WHEN cur_check_input%NOTFOUND;
+    END LOOP;
+    cnt:=0;
+    --получение столбцов таблицы из строки поотдельности
+    LOOP
+        IF SUBSTR(col_names, iter, 1) = ',' THEN
+            EXIT;
+        ELSE
+            temp_col_1:= temp_col_1 || SUBSTR(col_names, iter, 1);
+            iter:= iter + 1;
+        END IF;
+    END LOOP;
+    iter:=LENGTH(col_names);
+    LOOP
+        IF SUBSTR(col_names, iter-1, 1) = ',' THEN
+            EXIT;
+        ELSE
+            temp_col_2:= SUBSTR(col_names, iter, 1) || temp_col_2;
+            iter:= iter - 1;
+        END IF;
+    END LOOP;
+    
+    --проверка на существование столбцов таблицы в схеме и в заданной таблице
+    v_stmt:= 'SELECT column_name ' || 
+             'FROM user_tab_columns ' ||
+             'where column_name in (''' || to_char(UPPER(temp_col_1)) || ''',''' 
+                                        || to_char(UPPER(temp_col_2)) ||''') ' || 
+             'and table_name = any( select object_name ' ||
+                                   'from user_objects ' ||
+                                   'where object_name = ''' || to_char(UPPER(obj_name)) || ''' ' || 
+                                   'and object_type in (''VIEW'', ''TABLE''))';
+    OPEN cur_check_input FOR v_stmt;
+    LOOP
+        FETCH cur_check_input INTO temp_obj_name;
+        IF cnt = 0 and cur_check_input%NOTFOUND THEN
+            RAISE e_no_cols;
+        END IF;
+        cnt:= cnt+1;
+        EXIT WHEN cur_check_input%NOTFOUND;
+    END LOOP;
+    IF cnt < 3 THEN
+        RAISE e_no_cols;
+    END IF;
+    ----
+    -- получение столбцов таблицы при помощи динамического SQL
+    v_stmt:='SELECT ' || col_names || ' FROM  ' || obj_name;
+    OPEN cur_input FOR v_stmt;
+    LOOP
+        input_tab.extend(1);
+        FETCH cur_input INTO input_tab(input_tab.last);
+        EXIT WHEN cur_input%NOTFOUND;
+    END LOOP;
+    CLOSE cur_input;
+    
+    -- вызов ошибки при малом количестве полученных элементов
+    IF input_tab.count < 2 THEN
+        RAISE e_table_empty;
+    END IF;
+    
+    -------------
+    --main part--
+    -------------
+    v_current_node := 1;
+    --первичное заполнение массива последовательностей данными
+    FOR i IN input_tab.first..input_tab.last LOOP
+        tab_of_seqs.extend(1);
+        tab_of_seqs(tab_of_seqs.last):= type_seq();
+        tab_of_seqs(tab_of_seqs.last).extend(2);
+        tab_of_seqs(tab_of_seqs.last)(tab_of_seqs(tab_of_seqs.last).count-1) := input_tab(v_current_node).first_col;
+        tab_of_seqs(tab_of_seqs.last)(tab_of_seqs(tab_of_seqs.last).count) := input_tab(v_current_node).second_col;
+        v_current_node:= v_current_node + 1;        
+    END LOOP;
+    
+--поиск циклов в таблице, проход input_tab.count достаточен для обнаружения всех циклов в таблице
+    for h in 1..input_tab.count LOOP
+        --проход по всем последовательностям для обработки текущей последовательность
+            FOR i IN tab_of_seqs.first..tab_of_seqs.last LOOP
+            --если последовательность не конечная, то работаем дальше
+                IF NOT(tab_of_seqs(i)(tab_of_seqs(i).last)IS NULL) THEN
+                    --обработка следующей вершины
+                    FOR j IN input_tab.first..input_tab.last LOOP
+                        --если найдено продолжение
+                        IF tab_of_seqs(i)(tab_of_seqs(i).last) = input_tab(j).first_col THEN
+                            no_repeats:=true;
+                            --проверяем новую вершину на ведение в повторную
+                            FOR m IN tab_of_seqs(i).first..tab_of_seqs(i).last LOOP
+                                IF tab_of_seqs(i)(m) = input_tab(j).second_col AND m<>1 THEN
+                                    no_repeats := false;
+                                END IF;
+                            END LOOP;
+                            --если нет повторений, то
+                            IF no_repeats THEN
+                            --проверяем, не конечнаая ли эта вершина
+                                IF tab_of_seqs(i)(tab_of_seqs(i).first) = input_tab(j).second_col THEN
+                                    --если да, то добавляем новую последовательность  массив последовательностей с новой вершиной
+                                    --и ставим пустое поле в конце последовательности - конец последовательности
+                                    tab_of_seqs.extend(1);
+                                    tab_of_seqs(tab_of_seqs.last):= type_seq();
+                                    tab_of_seqs(tab_of_seqs.last).extend(tab_of_seqs(i).count);
+                                    FOR k IN tab_of_seqs(tab_of_seqs.last).first..tab_of_seqs(tab_of_seqs.last).last LOOP
+                                         tab_of_seqs(tab_of_seqs.last)(k):= tab_of_seqs(i)(k);
+                                    END LOOP;
+                                    tab_of_seqs(tab_of_seqs.last).extend(2);
+                                    tab_of_seqs(tab_of_seqs.last)(tab_of_seqs(tab_of_seqs.last).count-1):=input_tab(j).second_col;
+                                    tab_of_seqs(tab_of_seqs.last)(tab_of_seqs(tab_of_seqs.last).count):=null;
+                                ELSE
+                                --иначе просто добавляем последоввательность с нвоой точкой в массив
+                                    tab_of_seqs.extend(1);
+                                    tab_of_seqs(tab_of_seqs.last):= type_seq();
+                                    tab_of_seqs(tab_of_seqs.last).extend(tab_of_seqs(i).count);
+                                    FOR k IN tab_of_seqs(tab_of_seqs.last).first..tab_of_seqs(tab_of_seqs.last).last LOOP
+                                         tab_of_seqs(tab_of_seqs.last)(k):= tab_of_seqs(i)(k);
+                                    END LOOP;
+                                    tab_of_seqs(tab_of_seqs.last).extend(1);
+                                    tab_of_seqs(tab_of_seqs.last)(tab_of_seqs(tab_of_seqs.last).count):=input_tab(j).second_col;
+                                END IF;
+                            END IF;
+                        END IF;
+                    --
+                    END LOOP;
+                    --заканчиваем обработанную последовательность
+                    tab_of_seqs(i).extend(1);
+                    tab_of_seqs(i)(tab_of_seqs(i).last):=null;
+                END IF;
+            END LOOP;
+    end loop;    
+    
+    --убираем "мусор", то есть полученные в ходе обработки промежуточные последовательности
+    FOR i IN tab_of_seqs.first..tab_of_seqs.last LOOP
+            if tab_of_seqs(i).count > 2  AND NOT (tab_of_seqs(i).first IS NULL) then
+                --выбираем только законченные с двух сторон последовательности
+                if tab_of_seqs(i)(tab_of_seqs(i).first) = tab_of_seqs(i)(tab_of_seqs(i).last - 1) THEN
+                    result_tab_of_seqs.extend(1);
+                    result_tab_of_seqs(result_tab_of_seqs.last):= type_seq();
+                    FOR j IN tab_of_seqs(i).first..tab_of_seqs(i).last LOOP
+                        IF NOT(tab_of_seqs(i)(j) IS NULL) THEN
+                            result_tab_of_seqs(result_tab_of_seqs.last).extend(1);
+                            result_tab_of_seqs(result_tab_of_seqs.last)(result_tab_of_seqs(result_tab_of_seqs.last).last):=tab_of_seqs(i)(j);
+                        END IF;
+                    END LOOP;
+                END IF;
+                
+            end if;
+    END LOOP;
+    --если список последовательностей пустой то выходим
+    if result_tab_of_seqs.count = 0 then
+        raise e_no_seqs;
+    end if;
+    --сортируем результирующие последовательности
+    FOR i IN result_tab_of_seqs.first..result_tab_of_seqs.last LOOP 
+        FOR j IN result_tab_of_seqs.first..result_tab_of_seqs.last - i LOOP
+            IF result_tab_of_seqs(j)(result_tab_of_seqs(j).first) > result_tab_of_seqs(j + 1)(result_tab_of_seqs(j+1).first) THEN
+                temp_seq:= type_seq();
+                FOR k IN result_tab_of_seqs(j).first..result_tab_of_seqs(j).last LOOP
+                    temp_seq.extend(1);
+                    temp_seq(temp_seq.last) := result_tab_of_seqs(j)(k);
+                END LOOP;
+                result_tab_of_seqs(j) := type_seq();
+                FOR k IN result_tab_of_seqs(j + 1).first..result_tab_of_seqs(j + 1).last LOOP
+                    result_tab_of_seqs(j).extend(1);
+                    result_tab_of_seqs(j)(result_tab_of_seqs(j).last) := result_tab_of_seqs(j + 1)(k);
+                END LOOP;
+                result_tab_of_seqs(j + 1) := type_seq();
+                FOR k IN temp_seq.first..temp_seq.last LOOP
+                    result_tab_of_seqs(j + 1).extend(1);
+                    result_tab_of_seqs(j + 1)(result_tab_of_seqs(j + 1).last) := temp_seq(k);
+                END LOOP;
+            END IF;
+        END LOOP;
+    END LOOP;
+    
+    --поиск уникальных последовательностей
+    seq_for_delete:=false;
+    FOR i IN result_tab_of_seqs.first..result_tab_of_seqs.last LOOP 
+        seq_for_delete:=false;
+        no_repeats_2:=true;
+        --составление списка пройденных вершин
+        IF passed_start_points.count >0 THEN 
+            FOR m IN passed_start_points.first..passed_start_points.last LOOP
+                IF result_tab_of_seqs(i)(result_tab_of_seqs(i).first) = passed_start_points(m) THEN
+                    no_repeats_2:=false;        
+                END IF;
+            END LOOP;
+        END IF;
+        
+        IF no_repeats_2 THEN
+            passed_start_points.extend(1);
+            passed_start_points(passed_start_points.last):= result_tab_of_seqs(i)(result_tab_of_seqs(i).first);
+        END IF;
+        --если длина последовательности больше трех, то ищем, нет ли в ней уже использованной вершины
+        IF result_tab_of_seqs(i).count > 3 THEN
+            FOR j IN result_tab_of_seqs(i).first+1..result_tab_of_seqs(i).last-1 LOOP 
+                FOR k IN passed_start_points.first..passed_start_points.last LOOP
+                    IF result_tab_of_seqs(i)(j)= passed_start_points(k) THEN
+                        seq_for_delete:=true;
+                    END IF;
+                END LOOP;
+            END LOOP;
+        ELSE
+        --если меньше трех, то смотрим, пройдена ли центоровая вершина в данной последовательности, или нет
+            FOR k IN passed_start_points.first..passed_start_points.last LOOP
+                IF result_tab_of_seqs(i)(2)= passed_start_points(k) THEN
+                    seq_for_delete:=true;
+                END IF;
+            END LOOP;            
+        END IF;
+        --очистка последовательности с повторением вершины
+        IF seq_for_delete THEN
+            result_tab_of_seqs(i):= type_seq();
+        END IF;
+    END LOOP;
+    --поиск последдовательностей один в один одинаковых
+    FOR i IN result_tab_of_seqs.first..result_tab_of_seqs.last LOOP
+        FOR j IN result_tab_of_seqs.first..result_tab_of_seqs.last LOOP
+            IF i <> j AND result_tab_of_seqs(i).count >0 THEN
+                IF result_tab_of_seqs(i).count = result_tab_of_seqs(j).count THEN
+                    iter:=0;
+                    FOR k IN result_tab_of_seqs(i).first..result_tab_of_seqs(i).last LOOP
+                        IF result_tab_of_seqs(i)(k) = result_tab_of_seqs(j)(k) THEN
+                            iter := iter + 1;
+                        END IF;
+                    END LOOP;
+                    IF iter = result_tab_of_seqs(j).count THEN
+                        result_tab_of_seqs(j):= type_seq();
+                    END IF;
+                END IF;
+                
+            END IF;
+        END LOOP;
+    END LOOP;
+    --вывод пооследовательностей
+    iter:=0;
+    FOR i IN result_tab_of_seqs.first..result_tab_of_seqs.last LOOP
+        v_stmt:='';
+        IF NOT(result_tab_of_seqs(i).count = 0) THEN
+            FOR j IN result_tab_of_seqs(i).first..result_tab_of_seqs(i).last LOOP
+                IF NOT(result_tab_of_seqs(i)(j) IS NULL) THEN
+                    v_stmt:=v_stmt || result_tab_of_seqs(i)(j) || '->';
+                    iter:=1;
+                END IF;
+            END LOOP;
+            dbms_output.put_line(SUBSTR(v_stmt, 0, LENGTH(v_stmt)-2));
+        END IF;
+    END LOOP;
+    --проверка на отсутствие последовательностей
+    IF iter = 0 THEN
+        RAISE e_no_seqs;
+    END IF;
+    
+-- блок обработки ошибок
+EXCEPTION
+    WHEN e_input_empty THEN
+        DBMS_OUTPUT.PUT_LINE('Input value(s) is(are) empty or null.');
+    WHEN e_no_table THEN
+        DBMS_OUTPUT.PUT_LINE('This table/view doesn''t exist.');
+    WHEN e_table_empty THEN
+        DBMS_OUTPUT.PUT_LINE('No or very little amount of data in the table.');
+    WHEN NO_DATA_FOUND THEN
+        DBMS_OUTPUT.PUT_LINE('No data in cursor.');
+    WHEN e_no_seqs THEN
+        DBMS_OUTPUT.PUT_LINE('No sequences found.');
+    WHEN ROWTYPE_MISMATCH THEN
+        DBMS_OUTPUT.PUT_LINE('Procedure can only process numeric values. One or more columns have wrong datatype.');
+    WHEN INVALID_NUMBER THEN
+        DBMS_OUTPUT.PUT_LINE('Procedure can only process numeric values. One or more columns have wrong datatype.');
+    WHEN e_no_cols THEN
+        DBMS_OUTPUT.PUT_LINE('One or both of the culumns don''t exist in this table.');
+END;
+/
